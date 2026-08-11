@@ -118,6 +118,30 @@ namespace PLSQLGatewayModule
             }
         }
 
+        /// <summary>
+        /// Replaces one occurrence of oldValue with newValue, both in the scalar value and
+        /// in the values list. Used by the file-upload logic when the database (e.g.
+        /// apex_util.set_blob) generates the stored file name itself: the parameter value
+        /// passed to the target procedure must then be updated to match the name the
+        /// database actually stored the file under.
+        /// </summary>
+        public void ReplaceValue(string oldValue, string newValue)
+        {
+            if (_value == oldValue)
+            {
+                _value = newValue;
+            }
+
+            for (int i = 0; i < _values.Count; i++)
+            {
+                if (_values[i] == oldValue)
+                {
+                    _values[i] = newValue;
+                    break;
+                }
+            }
+        }
+
         public string DebugValue
         {
             get

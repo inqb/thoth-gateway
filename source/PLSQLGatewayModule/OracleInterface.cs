@@ -52,6 +52,7 @@ namespace PLSQLGatewayModule
         private string _apexUploadApiName = "";
         private List<string> _apexUploadApiParamNames = new List<string>();
         private List<string> _apexUploadApiParamTypes = new List<string>();
+        private bool _apexUploadApiIsFunction = false;
 
         /// <summary>
         /// Holds the set of columns that actually exist on a configured DocumentTableName,
@@ -657,9 +658,16 @@ namespace PLSQLGatewayModule
                       else
                       {
                           bool apiAvailable;
-                          uploadOk = TryUploadViaApexApi(files[i], fileData, mimeType, requestParams, out apiAvailable);
+                          string generatedName;
+                          uploadOk = TryUploadViaApexApi(files[i], fileData, mimeType, requestParams, out apiAvailable, out generatedName);
 
-                          if (!apiAvailable)
+                          if (uploadOk)
+                          {
+                              // the database generated the stored file name -- the target
+                              // procedure must receive that name, not the gateway's own
+                              ApplyGeneratedFileName(requestParams, files[i], generatedName);
+                          }
+                          else if (!apiAvailable)
                           {
                               if (uploadMode == "apex")
                               {
@@ -770,9 +778,38 @@ namespace PLSQLGatewayModule
                       }
 
                       _apexUploadApiName = candidate;
+
+                      // determine whether this is a FUNCTION (a row with position = 0 and a
+                      // null argument_name in ALL_ARGUMENTS represents the return value).
+                      // In current APEX versions apex_util.set_blob is a function whose
+                      // return value is the generated file name that the file's parameter
+                      // value must be replaced with before calling the target procedure.
+                      _apexUploadApiIsFunction = false;
+
+                      string retSql = "select count(*) from all_arguments where owner = :p_owner and nvl(package_name, '~') = nvl(:p_package, '~') and object_name = :p_object and position = 0 and argument_name is null";
+
+                      OracleCommand retCmd = new OracleCommand(retSql, _conn);
+                      retCmd.Parameters.Add("p_owner", OracleDbType.Varchar2, ooi.SchemaName, ParameterDirection.Input);
+                      retCmd.Parameters.Add("p_package", OracleDbType.Varchar2, ooi.PackageName, ParameterDirection.Input);
+                      retCmd.Parameters.Add("p_object", OracleDbType.Varchar2, ooi.ObjectName, ParameterDirection.Input);
+
+                      try
+                      {
+                          OracleDataReader retDr = retCmd.ExecuteReader();
+
+                          if (retDr.Read())
+                          {
+                              _apexUploadApiIsFunction = (Convert.ToInt32(retDr[0]) > 0);
+                          }
+                      }
+                      catch (OracleException e)
+                      {
+                          logger.Warn("Could not determine whether " + candidate + " is a function or a procedure: " + e.Message + ". Assuming procedure.");
+                      }
+
                       _apexUploadApiState = 1;
 
-                      logger.Debug("APEX gateway upload API found: " + candidate + " (" + ooi.SchemaName + "." + ooi.PackageName + "." + ooi.ObjectName + "), parameters: " + string.Join(", ", _apexUploadApiParamNames.ToArray()));
+                      logger.Debug("APEX gateway upload API found: " + candidate + " (" + ooi.SchemaName + "." + ooi.PackageName + "." + ooi.ObjectName + "), " + (_apexUploadApiIsFunction ? "function" : "procedure") + ", parameters: " + string.Join(", ", _apexUploadApiParamNames.ToArray()));
 
                       return true;
                   }
@@ -800,9 +837,10 @@ namespace PLSQLGatewayModule
       /// but the call fails, apiAvailable is true and the method returns false, so the
       /// request fails visibly instead of silently switching storage semantics.
       /// </summary>
-      private bool TryUploadViaApexApi(UploadedFile uploadedFile, byte[] fileData, string mimeType, List<NameValuePair> requestParams, out bool apiAvailable)
+      private bool TryUploadViaApexApi(UploadedFile uploadedFile, byte[] fileData, string mimeType, List<NameValuePair> requestParams, out bool apiAvailable, out string generatedName)
       {
           apiAvailable = ProbeApexUploadApi();
+          generatedName = "";
 
           if (!apiAvailable)
           {
@@ -810,6 +848,9 @@ namespace PLSQLGatewayModule
           }
 
           string flowId = GetParamValue(requestParams, "p_flow_id");
+          string flowStepId = GetParamValue(requestParams, "p_flow_step_id");
+          string sessionId = GetParamValue(requestParams, "p_instance");
+          string requestValue = GetParamValue(requestParams, "p_request");
 
           StringBuilder callParams = new StringBuilder();
           List<OracleParameter> bindParams = new List<OracleParameter>();
@@ -837,6 +878,30 @@ namespace PLSQLGatewayModule
               {
                   p = new OracleParameter(bindName, OracleDbType.Varchar2);
                   p.Value = System.IO.Path.GetFileName(uploadedFile.FileName);
+              }
+              else if (upperName.Contains("SESSION") || upperName.Contains("INSTANCE"))
+              {
+                  // the APEX session id, posted by the page as p_instance. Binding NULL here
+                  // writes a row without session linkage, which makes the file invisible in
+                  // APEX_APPLICATION_TEMP_FILES -- so this mapping is essential.
+                  p = new OracleParameter(bindName, OracleDbType.Varchar2);
+                  p.Value = (sessionId.Length > 0) ? (object)sessionId : (object)DBNull.Value;
+
+                  if (sessionId.Length == 0)
+                  {
+                      logger.Warn("APEX upload API parameter '" + paramName + "' looks like a session id, but no p_instance was found on the request; binding NULL. The uploaded file will likely not be visible in APEX_APPLICATION_TEMP_FILES.");
+                  }
+              }
+              else if (upperName.Contains("PAGE") || upperName.Contains("FLOW_STEP"))
+              {
+                  // the APEX page id, posted by the page as p_flow_step_id
+                  p = new OracleParameter(bindName, OracleDbType.Varchar2);
+                  p.Value = (flowStepId.Length > 0) ? (object)flowStepId : (object)DBNull.Value;
+              }
+              else if (upperName == "P_REQUEST")
+              {
+                  p = new OracleParameter(bindName, OracleDbType.Varchar2);
+                  p.Value = (requestValue.Length > 0) ? (object)requestValue : (object)DBNull.Value;
               }
               else if (upperName.Contains("ITEM"))
               {
@@ -889,10 +954,33 @@ namespace PLSQLGatewayModule
               callParams.Append(paramName + " => :" + bindName);
           }
 
-          string sql = "begin " + _apexUploadApiName + " (" + callParams.ToString() + "); end;";
+          // apex_util.set_blob is a FUNCTION in current APEX versions: its return value is
+          // the generated name under which the file was stored, and this name (not the
+          // gateway-generated UniqueFileName) is what the target procedure (wwv_flow.accept)
+          // must receive as the file item's parameter value. Capture it via an output bind.
+          string sql;
+          OracleParameter pReturn = null;
+
+          if (_apexUploadApiIsFunction)
+          {
+              pReturn = new OracleParameter("ret", OracleDbType.Varchar2);
+              pReturn.Direction = ParameterDirection.Output;
+              pReturn.Size = 4000;
+
+              sql = "begin :ret := " + _apexUploadApiName + " (" + callParams.ToString() + "); end;";
+          }
+          else
+          {
+              sql = "begin " + _apexUploadApiName + " (" + callParams.ToString() + "); end;";
+          }
 
           OracleCommand cmd = new OracleCommand(sql, _conn);
           cmd.BindByName = true;
+
+          if (pReturn != null)
+          {
+              cmd.Parameters.Add(pReturn);
+          }
 
           foreach (OracleParameter p in bindParams)
           {
@@ -905,6 +993,13 @@ namespace PLSQLGatewayModule
           {
               cmd.ExecuteNonQuery();
               _lastError = "";
+
+              if (pReturn != null && pReturn.Status != OracleParameterStatus.NullFetched && pReturn.Value != null && pReturn.Value != DBNull.Value)
+              {
+                  generatedName = (string)(OracleString)pReturn.Value;
+                  logger.Debug("APEX gateway upload API stored the file under generated name: " + generatedName);
+              }
+
               return true;
           }
           catch (OracleException e)
@@ -914,6 +1009,36 @@ namespace PLSQLGatewayModule
               _lastError = e.Message;
               return false;
           }
+      }
+
+      /// <summary>
+      /// After the APEX upload API stores a file under a database-generated name, the file
+      /// item's parameter value (which the gateway pre-filled with its own UniqueFileName)
+      /// must be replaced with that generated name, so that the target procedure
+      /// (wwv_flow.accept) can find the file. Updates both the request parameter list and
+      /// the UploadedFile itself.
+      /// </summary>
+      private void ApplyGeneratedFileName(List<NameValuePair> requestParams, UploadedFile uploadedFile, string generatedName)
+      {
+          if (generatedName == null || generatedName.Length == 0 || generatedName == uploadedFile.UniqueFileName)
+          {
+              return;
+          }
+
+          if (requestParams != null)
+          {
+              foreach (NameValuePair nvp in requestParams)
+              {
+                  if (string.Equals(nvp.Name, uploadedFile.ParamName, StringComparison.OrdinalIgnoreCase))
+                  {
+                      nvp.ReplaceValue(uploadedFile.UniqueFileName, generatedName);
+                  }
+              }
+          }
+
+          logger.Debug("File parameter '" + uploadedFile.ParamName + "' value updated from gateway-generated name '" + uploadedFile.UniqueFileName + "' to database-generated name '" + generatedName + "'");
+
+          uploadedFile.UniqueFileName = generatedName;
       }
 
       /// <summary>
