@@ -190,13 +190,25 @@ namespace PLSQLGatewayModule
                 // connect to the database
                 OracleInterface ora = new OracleInterface(gReq, opc);
 
+                // tracks whether a file upload failed, so we can skip straight to the
+                // existing error-handling path below instead of silently proceeding to call
+                // the target procedure as if the upload had succeeded (which previously left
+                // the target procedure looking up a document-table row that was never written)
+                bool uploadFailed = false;
+
                 if (ora.Connected())
                 {
                     ora.SetupOwaCGI(gReq.CGIParameters, ctx.Request.UserHostName, ctx.Request.UserHostAddress, gReq.BasicAuthUsername, gReq.BasicAuthPassword);
 
                     if (ctx.Request.Files.Count > 0)
                     {
-                        bool uploadSuccess = ora.UploadFiles(gReq.UploadedFiles);
+                        bool uploadSuccess = ora.UploadFiles(gReq.UploadedFiles, gReq.RequestParameters);
+
+                        if (!uploadSuccess)
+                        {
+                            logger.Error("File upload failed: " + ora.GetLastErrorText());
+                            uploadFailed = true;
+                        }
                     }
 
                 }
@@ -209,6 +221,11 @@ namespace PLSQLGatewayModule
                 if (!ora.Connected())
                 {
                     logger.Debug("Failed to connect to database, skipping procedure execution.");
+                    success = false;
+                }
+                else if (uploadFailed)
+                {
+                    logger.Debug("File upload failed, skipping procedure execution.");
                     success = false;
                 }
                 else if (gReq.IsSoapRequest)

@@ -8,6 +8,7 @@ using Oracle.ManagedDataAccess.Client;
 using System.Collections.Specialized;
 using Oracle.ManagedDataAccess.Types;
 using System.Text;
+using System.IO;
 using log4net;
 
 namespace PLSQLGatewayModule
@@ -40,6 +41,24 @@ namespace PLSQLGatewayModule
 
         private string _wsdlBody = "";
         private string _soapBody = "";
+
+        // cache of document-table column metadata, keyed by (upper-cased) table name,
+        // so we only look it up once per connection instead of once per uploaded file
+        private Dictionary<string, DocumentTableMetadata> _documentTableMetadataCache = new Dictionary<string, DocumentTableMetadata>();
+
+        /// <summary>
+        /// Holds the set of columns that actually exist on a configured DocumentTableName,
+        /// plus any NOT NULL columns without a default that we don't know how to populate.
+        /// Used so that UploadFiles() can build an INSERT that matches whatever the real
+        /// table looks like today, instead of a hardcoded column list that may be stale
+        /// (this matters a lot for Oracle's internal WWV_FLOW_FILE_OBJECTS$ table, whose
+        /// shape is undocumented and has changed across APEX releases).
+        /// </summary>
+        private class DocumentTableMetadata
+        {
+            public HashSet<string> Columns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            public List<string> RequiredColumnsWithoutValue = new List<string>();
+        }
 
       public OracleInterface(GatewayRequest req, OracleParameterCache opc)
       {
@@ -509,7 +528,7 @@ namespace PLSQLGatewayModule
       }
 
 
-      public bool UploadFiles(List<UploadedFile> files)
+      public bool UploadFiles(List<UploadedFile> files, List<NameValuePair> requestParams)
       {
 
           logger.Debug(string.Format("Uploading {0} file(s)...", files.Count));
@@ -554,8 +573,10 @@ namespace PLSQLGatewayModule
                       logger.Debug("Uploading to XDB Repository: " + resourceLocation);
 
                       // read the file into a byte array
-                      byte[] fileData = new byte[f.InputStream.Length];
-                      f.InputStream.Read(fileData, 0, System.Convert.ToInt32(f.InputStream.Length));
+                      // NOTE: Stream.Read() is not guaranteed to fill the buffer in one call,
+                      // especially for larger files -- read in a loop (or use ReadFully) to
+                      // avoid silently truncating the upload.
+                      byte[] fileData = ReadFully(f.InputStream);
 
                       // see http://stanford.edu/dept/itss/docs/oracle/10g/appdev.101/b10790/xdb19rpl.htm#i1028077
                       // see http://www.adp-gmbh.ch/ora/misc/globalization.html#char_sets
@@ -594,9 +615,8 @@ namespace PLSQLGatewayModule
                   {
                       logger.Debug("Uploading to database table with unique file name: " + files[i].UniqueFileName);
 
-                      // read the file into a byte array
-                      byte[] fileData = new byte[f.InputStream.Length];
-                      f.InputStream.Read(fileData, 0, System.Convert.ToInt32(f.InputStream.Length));
+                      // read the file into a byte array (see ReadFully() note above)
+                      byte[] fileData = ReadFully(f.InputStream);
 
                       // use the mime type as defined on the server (see IIS or website settings) instead of the mime type submitted by the client
                       mimeType = System.Web.MimeMapping.GetMimeMapping(files[i].UniqueFileName);
@@ -604,27 +624,10 @@ namespace PLSQLGatewayModule
                       logger.Debug("MIME type from request: " + f.ContentType);
                       logger.Debug("MIME type from file name: " + mimeType);
 
-                      string sql = "insert into " + _dadConfig.DocumentTableName + " (name, mime_type, doc_size, dad_charset, last_updated, content_type, blob_content) values (:p_name, :p_mime_type, :p_doc_size, :p_dad_charset, sysdate, 'BLOB', :p_blob_content )";
+                      bool uploadOk = InsertIntoDocumentTable(files[i], fileData, mimeType, requestParams);
 
-                      OracleCommand cmd = new OracleCommand(sql, _conn);
-
-                      OracleParameter p1 = cmd.Parameters.Add("p_name", OracleDbType.Varchar2, files[i].UniqueFileName, ParameterDirection.Input);
-                      OracleParameter p2 = cmd.Parameters.Add("p_mime_type", OracleDbType.Varchar2, mimeType, ParameterDirection.Input);
-                      OracleParameter p3 = cmd.Parameters.Add("p_doc_size", OracleDbType.Int32, f.InputStream.Length, ParameterDirection.Input);
-                      OracleParameter p4 = cmd.Parameters.Add("p_dad_charset", OracleDbType.Varchar2, _dadConfig.NLSCharset, ParameterDirection.Input);
-                      OracleParameter p5 = cmd.Parameters.Add("p_blob_content", OracleDbType.Blob, fileData, ParameterDirection.Input);
-
-                      logger.Debug("Executing SQL: " + cmd.CommandText);
-
-                      try
+                      if (!uploadOk)
                       {
-                          cmd.ExecuteNonQuery();
-                          _lastError = "";
-                      }
-                      catch (OracleException e)
-                      {
-                          logger.Error("Command failed: " + e.Message);
-                          _lastError = e.Message;
                           return false;
                       }
                   }
@@ -635,6 +638,327 @@ namespace PLSQLGatewayModule
 
           return true;
 
+      }
+
+      /// <summary>
+      /// Reads an entire stream into a byte array. Stream.Read() is allowed by contract to
+      /// return fewer bytes than requested even when more data is available (this is common
+      /// for larger, network-backed HttpPostedFile streams), so a single Read() call -- as the
+      /// original code used -- can silently truncate the uploaded file. This reads in a loop
+      /// (via CopyTo) until the stream is exhausted.
+      /// </summary>
+      private byte[] ReadFully(Stream input)
+      {
+          if (input.CanSeek)
+          {
+              input.Position = 0;
+          }
+
+          using (MemoryStream ms = new MemoryStream())
+          {
+              input.CopyTo(ms);
+              return ms.ToArray();
+          }
+      }
+
+      private string GetParamValue(List<NameValuePair> requestParams, string name)
+      {
+          if (requestParams == null)
+          {
+              return "";
+          }
+
+          foreach (NameValuePair nvp in requestParams)
+          {
+              if (string.Equals(nvp.Name, name, StringComparison.OrdinalIgnoreCase))
+              {
+                  return nvp.Value;
+              }
+          }
+
+          return "";
+      }
+
+      /// <summary>
+      /// Looks up the column metadata (existing columns, and NOT NULL columns without a
+      /// default) for a configured DocumentTableName, via ALL_TAB_COLUMNS. Cached per table
+      /// name for the lifetime of this connection.
+      ///
+      /// This exists because UploadFiles() historically hardcoded a 7-column INSERT that
+      /// matches the classic mod_plsql "document table" definition. When DocumentTableName
+      /// points at Oracle's own internal APEX table (WWV_FLOW_FILE_OBJECTS$, as used for
+      /// File Browse page items), that table has additional columns -- notably
+      /// SECURITY_GROUP_ID and FLOW_ID, which scope the row to an APEX workspace/application
+      /// and which APEX's own file-handling relies on to find the row again -- that the
+      /// hardcoded INSERT never populated. Because that internal table's shape is
+      /// undocumented and has changed across APEX releases, we look it up at runtime instead
+      /// of guessing.
+      /// </summary>
+      private DocumentTableMetadata GetDocumentTableMetadata(string tableName)
+      {
+          string cacheKey = tableName.ToUpperInvariant();
+
+          if (_documentTableMetadataCache.ContainsKey(cacheKey))
+          {
+              return _documentTableMetadataCache[cacheKey];
+          }
+
+          DocumentTableMetadata meta = new DocumentTableMetadata();
+
+          string schema = "";
+          string table = tableName;
+          int dotPos = tableName.IndexOf('.');
+
+          if (dotPos > -1)
+          {
+              schema = tableName.Substring(0, dotPos).Trim('"');
+              table = tableName.Substring(dotPos + 1);
+          }
+
+          table = table.Trim('"');
+
+          string sql = (schema.Length > 0)
+              ? "select column_name, nullable, data_default from all_tab_columns where owner = upper(:p_owner) and table_name = upper(:p_table)"
+              : "select column_name, nullable, data_default from all_tab_columns where table_name = upper(:p_table)";
+
+          OracleCommand cmd = new OracleCommand(sql, _conn);
+
+          if (schema.Length > 0)
+          {
+              cmd.Parameters.Add("p_owner", OracleDbType.Varchar2, schema, ParameterDirection.Input);
+          }
+
+          cmd.Parameters.Add("p_table", OracleDbType.Varchar2, table, ParameterDirection.Input);
+
+          try
+          {
+              OracleDataReader dr = cmd.ExecuteReader();
+
+              while (dr.Read())
+              {
+                  string colName = dr[0].ToString();
+                  string nullable = dr[1].ToString();
+                  bool hasDefault = !dr.IsDBNull(2);
+
+                  meta.Columns.Add(colName);
+
+                  if (nullable == "N" && !hasDefault)
+                  {
+                      meta.RequiredColumnsWithoutValue.Add(colName);
+                  }
+              }
+          }
+          catch (OracleException e)
+          {
+              logger.Warn("Could not look up column metadata for document table '" + tableName + "' via ALL_TAB_COLUMNS: " + e.Message);
+          }
+
+          if (meta.Columns.Count == 0)
+          {
+              logger.Warn("No columns found for document table '" + tableName + "' -- check that DocumentTableName is correct, that the table exists, and that the gateway's database user (" + _dadConfig.DatabaseUserName + ") has SELECT privilege on ALL_TAB_COLUMNS as well as SELECT/INSERT on the table itself. Falling back to the classic document-table column set.");
+          }
+
+          _documentTableMetadataCache[cacheKey] = meta;
+
+          return meta;
+      }
+
+      /// <summary>
+      /// Resolves an APEX workspace's SECURITY_GROUP_ID from the application (flow) id posted
+      /// with the request. In Oracle APEX, security_group_id and workspace_id are the same
+      /// value, and every row in WWV_FLOW_FILE_OBJECTS$ must carry the correct
+      /// security_group_id or it will never be visible to the application via
+      /// APEX_APPLICATION_FILES / APEX_APPLICATION_TEMP_FILES.
+      /// Returns 0 if it could not be resolved.
+      /// </summary>
+      private int GetApexSecurityGroupId(string flowId)
+      {
+          int applicationId;
+
+          if (!int.TryParse(flowId, out applicationId))
+          {
+              return 0;
+          }
+
+          string sql = "select workspace_id from apex_applications where application_id = :p_app_id";
+
+          OracleCommand cmd = new OracleCommand(sql, _conn);
+          cmd.Parameters.Add("p_app_id", OracleDbType.Int32, applicationId, ParameterDirection.Input);
+
+          try
+          {
+              OracleDataReader dr = cmd.ExecuteReader();
+
+              if (dr.Read())
+              {
+                  return Convert.ToInt32(dr[0]);
+              }
+
+              logger.Warn("Could not find application " + applicationId + " in APEX_APPLICATIONS while resolving security_group_id for file upload.");
+              return 0;
+          }
+          catch (OracleException e)
+          {
+              logger.Warn("Failed to resolve security_group_id for application " + applicationId + ": " + e.Message);
+              return 0;
+          }
+      }
+
+      /// <summary>
+      /// Inserts one uploaded file into the DAD's configured DocumentTableName. The column
+      /// list is built dynamically from the table's actual current columns (see
+      /// GetDocumentTableMetadata) rather than a hardcoded list, and -- when the table looks
+      /// like APEX's internal WWV_FLOW_FILE_OBJECTS$ table (i.e. it has FLOW_ID and/or
+      /// SECURITY_GROUP_ID columns) -- also populates flow_id/security_group_id from the
+      /// posted p_flow_id, which APEX needs in order to associate the uploaded file with the
+      /// correct application/workspace and pick it up into APEX_APPLICATION_TEMP_FILES.
+      /// </summary>
+      private bool InsertIntoDocumentTable(UploadedFile uploadedFile, byte[] fileData, string mimeType, List<NameValuePair> requestParams)
+      {
+          string tableName = _dadConfig.DocumentTableName;
+          DocumentTableMetadata meta = GetDocumentTableMetadata(tableName);
+
+          // if we couldn't determine the table's columns at all (e.g. no privilege on
+          // ALL_TAB_COLUMNS), fall back to the original hardcoded classic document-table
+          // column set rather than failing outright
+          bool haveMetadata = (meta.Columns.Count > 0);
+
+          List<string> colNames = new List<string>();
+          List<string> colExpressions = new List<string>();
+          List<OracleParameter> colParams = new List<OracleParameter>();
+
+          // name (mandatory in both the classic document table and WWV_FLOW_FILE_OBJECTS$)
+          AddDocumentTableColumn(colNames, colExpressions, colParams, meta, haveMetadata, "name", "p_name", OracleDbType.Varchar2, uploadedFile.UniqueFileName);
+
+          // filename -- present on WWV_FLOW_FILE_OBJECTS$ (the original client-supplied name), harmless to omit on a classic doc table that lacks it
+          AddDocumentTableColumn(colNames, colExpressions, colParams, meta, haveMetadata, "filename", "p_filename", OracleDbType.Varchar2, System.IO.Path.GetFileName(uploadedFile.FileName));
+
+          AddDocumentTableColumn(colNames, colExpressions, colParams, meta, haveMetadata, "mime_type", "p_mime_type", OracleDbType.Varchar2, mimeType);
+          AddDocumentTableColumn(colNames, colExpressions, colParams, meta, haveMetadata, "doc_size", "p_doc_size", OracleDbType.Int32, fileData.Length);
+          AddDocumentTableColumn(colNames, colExpressions, colParams, meta, haveMetadata, "dad_charset", "p_dad_charset", OracleDbType.Varchar2, _dadConfig.NLSCharset);
+          AddDocumentTableColumn(colNames, colExpressions, colParams, meta, haveMetadata, "content_type", "p_content_type", OracleDbType.Varchar2, "BLOB");
+          AddDocumentTableColumn(colNames, colExpressions, colParams, meta, haveMetadata, "blob_content", "p_blob_content", OracleDbType.Blob, fileData);
+
+          // last_updated is a SQL literal (sysdate), not a bind parameter
+          if (!haveMetadata || meta.Columns.Contains("last_updated"))
+          {
+              colNames.Add("last_updated");
+              colExpressions.Add("sysdate");
+          }
+
+          // APEX-specific scoping columns: only relevant (and only present) when
+          // DocumentTableName points at APEX's internal file table
+          if (haveMetadata && (meta.Columns.Contains("flow_id") || meta.Columns.Contains("security_group_id")))
+          {
+              string flowId = GetParamValue(requestParams, "p_flow_id");
+
+              if (flowId.Length == 0)
+              {
+                  logger.Warn("Document table '" + tableName + "' looks like APEX's internal file table (it has a FLOW_ID/SECURITY_GROUP_ID column), but no p_flow_id was found on the request, so flow_id/security_group_id cannot be set. The uploaded file will likely not be visible to the APEX application.");
+              }
+              else
+              {
+                  int flowIdInt;
+
+                  if (meta.Columns.Contains("flow_id") && int.TryParse(flowId, out flowIdInt))
+                  {
+                      AddDocumentTableColumn(colNames, colExpressions, colParams, meta, haveMetadata, "flow_id", "p_flow_id", OracleDbType.Int32, flowIdInt);
+                  }
+
+                  if (meta.Columns.Contains("security_group_id"))
+                  {
+                      int sgId = GetApexSecurityGroupId(flowId);
+
+                      if (sgId > 0)
+                      {
+                          AddDocumentTableColumn(colNames, colExpressions, colParams, meta, haveMetadata, "security_group_id", "p_security_group_id", OracleDbType.Int32, sgId);
+                      }
+                      else
+                      {
+                          logger.Warn("Could not resolve security_group_id for APEX application " + flowId + " -- the uploaded file may not be visible to the application.");
+                      }
+                  }
+              }
+          }
+
+          // warn (but don't necessarily fail) about any NOT NULL columns we didn't populate --
+          // this turns a mysterious ORA-01400 into an actionable log message
+          if (haveMetadata)
+          {
+              foreach (string requiredCol in meta.RequiredColumnsWithoutValue)
+              {
+                  if (!ListContainsIgnoreCase(colNames, requiredCol))
+                  {
+                      logger.Warn("Document table '" + tableName + "' has a NOT NULL column '" + requiredCol + "' with no default, which this gateway does not know how to populate. The insert below may fail with ORA-01400 because of it.");
+                  }
+              }
+          }
+
+          if (colNames.Count == 0)
+          {
+              _lastError = "No usable columns found for document table '" + tableName + "'";
+              logger.Error(_lastError);
+              return false;
+          }
+
+          string sql = "insert into " + tableName + " (" + string.Join(", ", colNames.ToArray()) + ") values (" + string.Join(", ", colExpressions.ToArray()) + ")";
+
+          OracleCommand cmd = new OracleCommand(sql, _conn);
+
+          foreach (OracleParameter p in colParams)
+          {
+              cmd.Parameters.Add(p);
+          }
+
+          logger.Debug("Executing SQL: " + cmd.CommandText);
+
+          try
+          {
+              cmd.ExecuteNonQuery();
+              _lastError = "";
+              return true;
+          }
+          catch (OracleException e)
+          {
+              logger.Error("Command failed: " + e.Message);
+              _lastError = e.Message;
+              return false;
+          }
+      }
+
+      private bool ListContainsIgnoreCase(List<string> list, string value)
+      {
+          foreach (string s in list)
+          {
+              if (string.Equals(s, value, StringComparison.OrdinalIgnoreCase))
+              {
+                  return true;
+              }
+          }
+
+          return false;
+      }
+
+      /// <summary>
+      /// Adds a bound column/value pair to the running INSERT lists, but only if the column
+      /// either (a) is known to exist on the target table, or (b) we have no metadata at all
+      /// for the table (in which case we fall back to the original hardcoded behavior and
+      /// include it unconditionally).
+      /// </summary>
+      private void AddDocumentTableColumn(List<string> colNames, List<string> colExpressions, List<OracleParameter> colParams, DocumentTableMetadata meta, bool haveMetadata, string columnName, string paramName, OracleDbType dbType, object value)
+      {
+          if (haveMetadata && !meta.Columns.Contains(columnName))
+          {
+              return;
+          }
+
+          colNames.Add(columnName);
+          colExpressions.Add(":" + paramName);
+
+          OracleParameter p = new OracleParameter(paramName, dbType);
+          p.Value = value;
+          p.Direction = ParameterDirection.Input;
+          colParams.Add(p);
       }
 
       public bool IsDownload
