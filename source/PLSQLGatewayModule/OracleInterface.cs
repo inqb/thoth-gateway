@@ -46,6 +46,13 @@ namespace PLSQLGatewayModule
         // so we only look it up once per connection instead of once per uploaded file
         private Dictionary<string, DocumentTableMetadata> _documentTableMetadataCache = new Dictionary<string, DocumentTableMetadata>();
 
+        // cached probe result for the APEX gateway upload API (apex_util.set_blob):
+        // 0 = not yet probed, 1 = available (signature cached below), -1 = not available
+        private int _apexUploadApiState = 0;
+        private string _apexUploadApiName = "";
+        private List<string> _apexUploadApiParamNames = new List<string>();
+        private List<string> _apexUploadApiParamTypes = new List<string>();
+
         /// <summary>
         /// Holds the set of columns that actually exist on a configured DocumentTableName,
         /// plus any NOT NULL columns without a default that we don't know how to populate.
@@ -613,8 +620,6 @@ namespace PLSQLGatewayModule
                   }
                   else
                   {
-                      logger.Debug("Uploading to database table with unique file name: " + files[i].UniqueFileName);
-
                       // read the file into a byte array (see ReadFully() note above)
                       byte[] fileData = ReadFully(f.InputStream);
 
@@ -624,7 +629,49 @@ namespace PLSQLGatewayModule
                       logger.Debug("MIME type from request: " + f.ContentType);
                       logger.Debug("MIME type from file name: " + mimeType);
 
-                      bool uploadOk = InsertIntoDocumentTable(files[i], fileData, mimeType, requestParams);
+                      // Upload strategy (DocumentUploadMode DAD parameter):
+                      //
+                      //   "Auto"  (default) - use the APEX gateway upload API (apex_util.set_blob) when it
+                      //                       is installed and executable, otherwise fall back to a direct
+                      //                       insert into DocumentTableName. This mirrors what ORDS does:
+                      //                       since ORDS 18.3, when APEX 5+ is detected, uploads go through
+                      //                       apex_util.set_blob rather than a staging-table insert, and
+                      //                       newer APEX versions expect this.
+                      //   "Apex"  - require the APEX API; fail the upload if it is not available.
+                      //   "Table" - legacy behavior; always insert directly into DocumentTableName.
+                      //
+                      // Note that apex_util.set_blob is not part of the documented APEX API Reference
+                      // (there is no documented PL/SQL API for gateway-side uploads even in APEX 24.x),
+                      // so its signature is described at runtime from ALL_ARGUMENTS and bound by name,
+                      // rather than hardcoded, to survive signature changes between APEX releases.
+
+                      string uploadMode = _dadConfig.DocumentUploadMode.ToLowerInvariant();
+
+                      bool uploadOk;
+
+                      if (uploadMode == "table")
+                      {
+                          logger.Debug("DocumentUploadMode=Table: uploading to database table with unique file name: " + files[i].UniqueFileName);
+                          uploadOk = InsertIntoDocumentTable(files[i], fileData, mimeType, requestParams);
+                      }
+                      else
+                      {
+                          bool apiAvailable;
+                          uploadOk = TryUploadViaApexApi(files[i], fileData, mimeType, requestParams, out apiAvailable);
+
+                          if (!apiAvailable)
+                          {
+                              if (uploadMode == "apex")
+                              {
+                                  _lastError = "DocumentUploadMode=Apex, but no APEX gateway upload API (apex_util.set_blob) is available/executable for this database user.";
+                                  logger.Error(_lastError);
+                                  return false;
+                              }
+
+                              logger.Debug("APEX gateway upload API not available; falling back to direct insert into document table with unique file name: " + files[i].UniqueFileName);
+                              uploadOk = InsertIntoDocumentTable(files[i], fileData, mimeType, requestParams);
+                          }
+                      }
 
                       if (!uploadOk)
                       {
@@ -677,6 +724,196 @@ namespace PLSQLGatewayModule
           }
 
           return "";
+      }
+
+      /// <summary>
+      /// Probes (once per connection) for the APEX gateway upload API and caches its
+      /// runtime-described signature. Candidates are tried in order:
+      ///   1. apex_util.set_blob   (what ORDS 18.3+ calls when APEX 5+ is present)
+      ///   2. apex_util.file_upload (older name checked for by ORDS at runtime)
+      /// Returns true if a usable procedure was found.
+      /// </summary>
+      private bool ProbeApexUploadApi()
+      {
+          if (_apexUploadApiState != 0)
+          {
+              return (_apexUploadApiState == 1);
+          }
+
+          string[] candidates = new string[] { "apex_util.set_blob", "apex_util.file_upload" };
+
+          foreach (string candidate in candidates)
+          {
+              string savedError = _lastError;
+
+              OracleObjectInfo ooi = ResolveName(candidate);
+
+              if (_lastError == "" && ooi.ObjectName != null && ooi.ObjectName.Length > 0)
+              {
+                  NameValueCollection procParams = GetProcParams(ooi.SchemaName, ooi.PackageName, ooi.ObjectName);
+
+                  if (_lastError == "" && procParams.Count > 0)
+                  {
+                      // GetProcParams orders by (overload, sequence) but does not separate
+                      // overloads; dedupe by name and keep the first occurrence of each,
+                      // which corresponds to the first overload.
+                      _apexUploadApiParamNames.Clear();
+                      _apexUploadApiParamTypes.Clear();
+
+                      foreach (string paramName in procParams)
+                      {
+                          if (!ListContainsIgnoreCase(_apexUploadApiParamNames, paramName))
+                          {
+                              _apexUploadApiParamNames.Add(paramName);
+                              _apexUploadApiParamTypes.Add(procParams.GetValues(paramName)[0]);
+                          }
+                      }
+
+                      _apexUploadApiName = candidate;
+                      _apexUploadApiState = 1;
+
+                      logger.Debug("APEX gateway upload API found: " + candidate + " (" + ooi.SchemaName + "." + ooi.PackageName + "." + ooi.ObjectName + "), parameters: " + string.Join(", ", _apexUploadApiParamNames.ToArray()));
+
+                      return true;
+                  }
+              }
+
+              // ResolveName/GetProcParams set _lastError on failure; a failed probe is not
+              // an error for the request, so restore the previous error state
+              _lastError = savedError;
+          }
+
+          logger.Debug("No APEX gateway upload API (apex_util.set_blob / apex_util.file_upload) found or executable for this database user.");
+          _apexUploadApiState = -1;
+
+          return false;
+      }
+
+      /// <summary>
+      /// Uploads one file through the APEX gateway upload API (see ProbeApexUploadApi),
+      /// binding the runtime-described parameters by name. Parameter mapping is heuristic
+      /// because the procedure is undocumented; anything unmapped is bound as NULL (and
+      /// logged) so procedure defaults apply where they exist.
+      ///
+      /// apiAvailable is set to false when no API procedure exists at all -- in that case
+      /// the caller may fall back to the direct document-table insert. If the API exists
+      /// but the call fails, apiAvailable is true and the method returns false, so the
+      /// request fails visibly instead of silently switching storage semantics.
+      /// </summary>
+      private bool TryUploadViaApexApi(UploadedFile uploadedFile, byte[] fileData, string mimeType, List<NameValuePair> requestParams, out bool apiAvailable)
+      {
+          apiAvailable = ProbeApexUploadApi();
+
+          if (!apiAvailable)
+          {
+              return false;
+          }
+
+          string flowId = GetParamValue(requestParams, "p_flow_id");
+
+          StringBuilder callParams = new StringBuilder();
+          List<OracleParameter> bindParams = new List<OracleParameter>();
+
+          for (int i = 0; i < _apexUploadApiParamNames.Count; i++)
+          {
+              string paramName = _apexUploadApiParamNames[i];
+              string upperName = paramName.ToUpperInvariant();
+              string dataType = _apexUploadApiParamTypes[i].ToUpperInvariant();
+
+              string bindName = "b" + (i + 1).ToString();
+              OracleParameter p;
+
+              if (dataType == "BLOB")
+              {
+                  p = new OracleParameter(bindName, OracleDbType.Blob);
+                  p.Value = fileData;
+              }
+              else if (upperName.Contains("MIME"))
+              {
+                  p = new OracleParameter(bindName, OracleDbType.Varchar2);
+                  p.Value = mimeType;
+              }
+              else if (upperName.Contains("FILENAME") || (upperName.Contains("FILE") && upperName.Contains("NAME")))
+              {
+                  p = new OracleParameter(bindName, OracleDbType.Varchar2);
+                  p.Value = System.IO.Path.GetFileName(uploadedFile.FileName);
+              }
+              else if (upperName.Contains("ITEM"))
+              {
+                  // the form field (page item) name the file was posted under
+                  p = new OracleParameter(bindName, OracleDbType.Varchar2);
+                  p.Value = uploadedFile.ParamName;
+              }
+              else if (upperName == "P_NAME" || upperName.EndsWith("_NAME"))
+              {
+                  p = new OracleParameter(bindName, OracleDbType.Varchar2);
+                  p.Value = uploadedFile.UniqueFileName;
+              }
+              else if (upperName.Contains("CHARSET"))
+              {
+                  p = new OracleParameter(bindName, OracleDbType.Varchar2);
+                  p.Value = _dadConfig.NLSCharset;
+              }
+              else if (upperName.Contains("FLOW") || upperName.Contains("APPLICATION"))
+              {
+                  int flowIdInt;
+
+                  if (flowId.Length > 0 && int.TryParse(flowId, out flowIdInt))
+                  {
+                      p = new OracleParameter(bindName, (dataType == "NUMBER") ? OracleDbType.Int32 : OracleDbType.Varchar2);
+                      p.Value = (dataType == "NUMBER") ? (object)flowIdInt : (object)flowId;
+                  }
+                  else
+                  {
+                      p = new OracleParameter(bindName, OracleDbType.Varchar2);
+                      p.Value = DBNull.Value;
+                      logger.Warn("APEX upload API parameter '" + paramName + "' looks like an application id, but no p_flow_id was found on the request; binding NULL. If the call fails (e.g. ORA-20888), this is why.");
+                  }
+              }
+              else
+              {
+                  // unknown parameter -- bind NULL so a procedure default (if any) applies
+                  p = new OracleParameter(bindName, OracleDbType.Varchar2);
+                  p.Value = DBNull.Value;
+                  logger.Debug("APEX upload API parameter '" + paramName + "' (" + dataType + ") is not recognized by the gateway; binding NULL.");
+              }
+
+              p.Direction = ParameterDirection.Input;
+              bindParams.Add(p);
+
+              if (callParams.Length > 0)
+              {
+                  callParams.Append(", ");
+              }
+
+              callParams.Append(paramName + " => :" + bindName);
+          }
+
+          string sql = "begin " + _apexUploadApiName + " (" + callParams.ToString() + "); end;";
+
+          OracleCommand cmd = new OracleCommand(sql, _conn);
+          cmd.BindByName = true;
+
+          foreach (OracleParameter p in bindParams)
+          {
+              cmd.Parameters.Add(p);
+          }
+
+          logger.Debug("Uploading via APEX gateway upload API. Executing SQL: " + cmd.CommandText);
+
+          try
+          {
+              cmd.ExecuteNonQuery();
+              _lastError = "";
+              return true;
+          }
+          catch (OracleException e)
+          {
+              logger.Error("APEX gateway upload API call failed: " + e.Message);
+              logger.Error("Signature used: " + _apexUploadApiName + " (" + string.Join(", ", _apexUploadApiParamNames.ToArray()) + "). If the parameter mapping is wrong for this APEX version, set DocumentUploadMode=Table in the DAD configuration to use the legacy direct insert instead.");
+              _lastError = e.Message;
+              return false;
+          }
       }
 
       /// <summary>

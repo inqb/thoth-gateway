@@ -215,6 +215,12 @@
     <td>&nbsp;</td>
   </tr>
   <tr>
+    <td><em>DocumentUploadMode</em></td>
+    <td>Controls how uploaded files are stored when neither DocumentFilePath nor DocumentXdbPath is set. "Auto" (the default) uses the APEX gateway upload API (apex_util.set_blob) when it is installed and executable by the gateway's database user, and otherwise falls back to a direct insert into DocumentTableName. This matches the behavior of ORDS (18.3 and later) and is what modern APEX versions (5.0+) expect. "Apex" requires the APEX API and fails uploads if it is unavailable. "Table" always inserts directly into DocumentTableName (the legacy behavior of the Thoth Gateway).</td>
+    <td>Auto | Apex | Table</td>
+    <td>Auto</td>
+  </tr>
+  <tr>
     <td>PathAlias</td>
     <td>&nbsp;</td>
     <td>&nbsp;</td>

@@ -232,6 +232,19 @@ namespace PLSQLGatewayModule
         {
             get { return getVal("DocumentXdbPath", ""); }
         }
+
+        /// <summary>
+        /// Controls how uploaded files are stored when neither DocumentFilePath nor
+        /// DocumentXdbPath is set:
+        ///   "Auto"  (default) - use the APEX gateway upload API (apex_util.set_blob) when
+        ///                       available, otherwise insert directly into DocumentTableName.
+        ///   "Apex"  - require the APEX gateway upload API; fail uploads if unavailable.
+        ///   "Table" - always insert directly into DocumentTableName (legacy behavior).
+        /// </summary>
+        public string DocumentUploadMode
+        {
+            get { return getVal("DocumentUploadMode", "Auto"); }
+        }
         
         public string PathAlias
         {
